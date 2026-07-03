@@ -32,9 +32,14 @@ function resolveBurstMinutes() {
   const raw = process.env.BURST_MINUTES || 'auto';
   const n = parseFloat(raw);
   if (Number.isFinite(n)) return { minutes: n, mode: 'explicit' };
+  // Auto mode = ONE check per run, always. Aggressive in-run bursts got the
+  // runner IPs reputation-blocked by Akamai (verified live); the reference
+  // repos survived months at one-check-per-run cadence. The workflow cron
+  // controls frequency (5 min active window / 30 min overnight). If a deal is
+  // found, the run auto-extends (see below) so stop-detection stays fast.
   const h = istHour();
   const active = h >= ACTIVE_START_IST && h < ACTIVE_END_IST;
-  return { minutes: active ? 13 : 0.05, mode: active ? 'auto-active' : 'auto-offhours' };
+  return { minutes: 0.05, mode: active ? 'auto-active' : 'auto-offhours' };
 }
 
 const UA =
@@ -151,7 +156,11 @@ async function scan() {
     }
     const products = extractProducts(html);
     if (!products.length) {
-      if (page === 1) console.log(`  [scan] page 1 len=${html.length}, no products (mode=${useBrowser ? 'browser' : 'fetch'})`);
+      if (page === 1) {
+        console.log(`  [scan] page 1 len=${html.length}, no products (mode=${useBrowser ? 'browser' : 'fetch'})`);
+        // Diagnostic: what did the block page actually say?
+        console.log(`  [scan] page head: ${html.slice(0, 250).replace(/\s+/g, ' ')}`);
+      }
       break;
     }
     let added = 0;

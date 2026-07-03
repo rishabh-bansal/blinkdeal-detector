@@ -2,14 +2,14 @@ name: BLINKDEAL Detector
 
 on:
   schedule:
-    # Tiered by the 100-day BLINKDEAL pattern data (sessions start ~6 AM–9 PM
-    # IST, near-zero overnight). GitHub cron is UTC; IST = UTC+5:30.
+    # One check per run (in-run bursts got runner IPs blocked by Akamai; the
+    # reference repos survived months at this cadence). Tiered by the 100-day
+    # BLINKDEAL pattern data (sessions ~6 AM–9 PM IST, near-zero overnight).
+    # GitHub cron is UTC; IST = UTC+5:30.
     #
-    # ACTIVE (07:15–23:30 IST): full 13-min bursts relaunched every 15 min
-    - cron: "45 1 * * *"
-    - cron: "*/15 2-17 * * *"
-    # OFF-HOURS (23:30–07:15 IST): one quick check every 30 min; scan.js
-    # auto-extends into a full burst if a deal is actually live
+    # ACTIVE (~07:30–23:30 IST): check every 5 min
+    - cron: "*/5 2-17 * * *"
+    # OFF-HOURS (23:30–07:30 IST): check every 30 min
     - cron: "11,41 18-23 * * *"
     - cron: "11,41 0-1 * * *"
   workflow_dispatch:
