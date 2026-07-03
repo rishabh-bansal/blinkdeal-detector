@@ -15,8 +15,27 @@ const MYNTRA_URL = process.env.MYNTRA_URL || 'https://www.myntra.com/gold-coin';
 const KEYWORDS = (process.env.COUPON_KEYWORDS || 'blinkdeal')
   .toLowerCase().split(',').map((s) => s.trim()).filter(Boolean);
 const MAX_PAGES = parseInt(process.env.MAX_PAGES || '2', 10);
-const BURST_MINUTES = parseFloat(process.env.BURST_MINUTES || '13');
 const INTERVAL_SECONDS = parseInt(process.env.INTERVAL_SECONDS || '60', 10);
+
+// Burst duration. "auto" (default) uses the 100-day BLINKDEAL pattern data:
+// sessions start almost exclusively 6 AM–9 PM IST, so inside the active
+// window (07–23 IST) we run full 13-min bursts; overnight we do one quick
+// check and exit (the workflow cron also runs less often overnight).
+const ACTIVE_START_IST = parseInt(process.env.ACTIVE_START_IST || '7', 10);
+const ACTIVE_END_IST = parseInt(process.env.ACTIVE_END_IST || '23', 10);
+
+function istHour() {
+  return new Date(Date.now() + 330 * 60000).getUTCHours();
+}
+
+function resolveBurstMinutes() {
+  const raw = process.env.BURST_MINUTES || 'auto';
+  const n = parseFloat(raw);
+  if (Number.isFinite(n)) return { minutes: n, mode: 'explicit' };
+  const h = istHour();
+  const active = h >= ACTIVE_START_IST && h < ACTIVE_END_IST;
+  return { minutes: active ? 13 : 0.05, mode: active ? 'auto-active' : 'auto-offhours' };
+}
 
 const UA =
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
@@ -103,8 +122,12 @@ async function main() {
     console.error('REPORT_KEY missing — set the Actions secret.');
     process.exit(1);
   }
-  const deadline = Date.now() + BURST_MINUTES * 60 * 1000;
-  console.log(`Burst monitor: ${BURST_MINUTES} min, every ${INTERVAL_SECONDS}s, keywords=[${KEYWORDS}]`);
+  const { minutes: burstMinutes, mode } = resolveBurstMinutes();
+  const jobStart = Date.now();
+  let deadline = jobStart + burstMinutes * 60 * 1000;
+  // Never exceed the workflow's 15-min job timeout, even after extensions.
+  const hardCap = jobStart + 14 * 60 * 1000;
+  console.log(`Burst monitor [${mode}]: ${burstMinutes} min, every ${INTERVAL_SECONDS}s, keywords=[${KEYWORDS}] (IST hour ${istHour()})`);
 
   let cycles = 0, blockedCycles = 0;
   while (Date.now() < deadline) {
@@ -122,6 +145,11 @@ async function main() {
           ? ` 🟢 DEAL x${deals.length} (worker: new=${r.newCount}, notified=${r.notifiedCount})`
           : r.cleared ? ' (worker: cleared, stop sent)' : '';
         console.log(`[${new Date().toISOString()}] products=${products.length} deals=${deals.length}${note}`);
+        // A deal is live: keep tracking it (fast stop detection) even if this
+        // run started as a quick off-hours check — up to the job's hard cap.
+        if (deals.length > 0) {
+          deadline = Math.min(Math.max(deadline, Date.now() + 5 * 60 * 1000), hardCap);
+        }
       }
     } catch (e) {
       console.log(`[${new Date().toISOString()}] cycle error: ${e.message}`);

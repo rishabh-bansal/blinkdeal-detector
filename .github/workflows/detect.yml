@@ -2,16 +2,22 @@ name: BLINKDEAL Detector
 
 on:
   schedule:
-    # Relaunch the burst monitor every 15 min (burst runs ~13 min inside).
-    # Same pattern as the reference repos that proved GitHub runners can
-    # reach Myntra.
-    - cron: "*/15 * * * *"
+    # Tiered by the 100-day BLINKDEAL pattern data (sessions start ~6 AM–9 PM
+    # IST, near-zero overnight). GitHub cron is UTC; IST = UTC+5:30.
+    #
+    # ACTIVE (07:15–23:30 IST): full 13-min bursts relaunched every 15 min
+    - cron: "45 1 * * *"
+    - cron: "*/15 2-17 * * *"
+    # OFF-HOURS (23:30–07:15 IST): one quick check every 30 min; scan.js
+    # auto-extends into a full burst if a deal is actually live
+    - cron: "11,41 18-23 * * *"
+    - cron: "11,41 0-1 * * *"
   workflow_dispatch:
     inputs:
       burst_minutes:
-        description: "How long this run should keep checking (minutes)"
+        description: "Burst length in minutes, or 'auto' (IST-aware)"
         required: false
-        default: "13"
+        default: "auto"
       interval_seconds:
         description: "Seconds between checks"
         required: false
@@ -42,6 +48,6 @@ jobs:
         env:
           REPORT_URL: https://blinkdeal.paype.co
           REPORT_KEY: ${{ secrets.REPORT_KEY }}
-          BURST_MINUTES: ${{ github.event.inputs.burst_minutes || '13' }}
+          BURST_MINUTES: ${{ github.event.inputs.burst_minutes || 'auto' }}
           INTERVAL_SECONDS: ${{ github.event.inputs.interval_seconds || '60' }}
         run: node scan.js
