@@ -54,6 +54,71 @@ function headers() {
   };
 }
 
+// ── Browser fallback ─────────────────────────────────────────────────────────
+// Plain fetch is sometimes served an Akamai challenge stub (~500 bytes) on
+// GitHub runners. Real Chrome executes the challenge and gets the page — the
+// approach the reference Blinkdeal repo ran successfully for months. We start
+// the browser lazily on first block and reuse it for the rest of the run.
+let browserCtx = null;
+let useBrowser = false;
+
+async function getBrowserPage() {
+  if (browserCtx) return browserCtx.page;
+  const { chromium } = await import('playwright');
+  const browser = await chromium.launch({
+    headless: true,
+    args: ['--disable-blink-features=AutomationControlled', '--no-sandbox', '--disable-dev-shm-usage'],
+  });
+  const context = await browser.newContext({
+    userAgent: UA,
+    viewport: { width: 1366, height: 768 },
+    locale: 'en-IN',
+  });
+  await context.addInitScript(
+    "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
+  );
+  const page = await context.newPage();
+  browserCtx = { browser, page };
+  return page;
+}
+
+export async function closeBrowser() {
+  if (browserCtx) {
+    await browserCtx.browser.close().catch(() => {});
+    browserCtx = null;
+  }
+}
+
+async function fetchHtmlPlain(url) {
+  const res = await fetch(url, { headers: headers(), redirect: 'follow', signal: AbortSignal.timeout(20000) });
+  const html = await res.text();
+  return { status: res.status, html };
+}
+
+async function fetchHtmlBrowser(url) {
+  const page = await getBrowserPage();
+  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
+  await page.waitForTimeout(2500); // let the challenge/content settle
+  return { status: 200, html: await page.content() };
+}
+
+async function fetchListingHtml(url, pageNo) {
+  if (!useBrowser) {
+    const r = await fetchHtmlPlain(url);
+    if (extractProducts(r.html).length > 0) return r;
+    console.log(`  [scan] plain fetch blocked on page ${pageNo} (HTTP ${r.status}, len=${r.html.length}) — switching to browser`);
+    try {
+      useBrowser = true;
+      return await fetchHtmlBrowser(url);
+    } catch (e) {
+      useBrowser = false; // playwright unavailable (e.g. local run) — stay on fetch
+      console.log(`  [scan] browser fallback unavailable: ${e.message.split('\n')[0]}`);
+      return r;
+    }
+  }
+  return fetchHtmlBrowser(url);
+}
+
 async function scan() {
   const all = [];
   const seen = new Set();
@@ -62,17 +127,16 @@ async function scan() {
     const url = page === 1 ? MYNTRA_URL : `${MYNTRA_URL}${sep}p=${page}`;
     let html = '';
     try {
-      const res = await fetch(url, { headers: headers(), redirect: 'follow', signal: AbortSignal.timeout(20000) });
-      html = await res.text();
-      if (page === 1 && !html.includes('"products"')) {
-        console.log(`  [scan] page 1 HTTP ${res.status}, len=${html.length}, no products JSON — possibly blocked`);
-      }
+      ({ html } = await fetchListingHtml(url, page));
     } catch (e) {
-      console.log(`  [scan] page ${page} fetch failed: ${e.message}`);
+      console.log(`  [scan] page ${page} fetch failed: ${e.message.split('\n')[0]}`);
       break;
     }
     const products = extractProducts(html);
-    if (!products.length) break;
+    if (!products.length) {
+      if (page === 1) console.log(`  [scan] page 1 len=${html.length}, no products (mode=${useBrowser ? 'browser' : 'fetch'})`);
+      break;
+    }
     let added = 0;
     for (const p of products) {
       const id = String(p.productId ?? p.id ?? '');
@@ -161,7 +225,8 @@ async function main() {
     await new Promise((r) => setTimeout(r, sleep));
   }
 
-  console.log(`Burst done: ${cycles} cycles, ${blockedCycles} blocked/empty.`);
+  console.log(`Burst done: ${cycles} cycles, ${blockedCycles} blocked/empty (mode=${useBrowser ? 'browser' : 'fetch'}).`);
+  await closeBrowser();
   if (cycles > 0 && blockedCycles === cycles) {
     console.error('EVERY cycle returned 0 products — Myntra may be blocking this runner. Investigate.');
     process.exit(2); // surface as a failed run so it's visible
