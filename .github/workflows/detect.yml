@@ -1,0 +1,47 @@
+name: BLINKDEAL Detector
+
+on:
+  schedule:
+    # Relaunch the burst monitor every 15 min (burst runs ~13 min inside).
+    # Same pattern as the reference repos that proved GitHub runners can
+    # reach Myntra.
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+    inputs:
+      burst_minutes:
+        description: "How long this run should keep checking (minutes)"
+        required: false
+        default: "13"
+      interval_seconds:
+        description: "Seconds between checks"
+        required: false
+        default: "60"
+
+# Never let two bursts overlap (cron delays can stack runs).
+concurrency:
+  group: blinkdeal-detector
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Run burst monitor
+        env:
+          REPORT_URL: https://blinkdeal.paype.co
+          REPORT_KEY: ${{ secrets.REPORT_KEY }}
+          BURST_MINUTES: ${{ github.event.inputs.burst_minutes || '13' }}
+          INTERVAL_SECONDS: ${{ github.event.inputs.interval_seconds || '60' }}
+        run: node scan.js
