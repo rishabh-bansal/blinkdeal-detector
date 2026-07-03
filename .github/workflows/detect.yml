@@ -53,10 +53,10 @@ jobs:
           path: ~/.cache/ms-playwright
           key: playwright-chromium-${{ runner.os }}
 
-      - name: Install Playwright Chromium
+      - name: Install Playwright + real Chrome
         run: |
           npm install --no-save playwright
-          npx playwright install --with-deps chromium
+          npx playwright install --with-deps chrome || npx playwright install --with-deps chromium
 
       - name: Run burst monitor
         env:

@@ -65,10 +65,18 @@ let useBrowser = false;
 async function getBrowserPage() {
   if (browserCtx) return browserCtx.page;
   const { chromium } = await import('playwright');
-  const browser = await chromium.launch({
+  const launchOpts = {
     headless: true,
     args: ['--disable-blink-features=AutomationControlled', '--no-sandbox', '--disable-dev-shm-usage'],
-  });
+  };
+  let browser;
+  try {
+    // Real Google Chrome — what the reference Blinkdeal repo ran for months.
+    // Chromium headless-shell gets detected by Akamai (verified: 481-byte stub).
+    browser = await chromium.launch({ ...launchOpts, channel: 'chrome' });
+  } catch {
+    browser = await chromium.launch(launchOpts); // fall back to bundled chromium
+  }
   const context = await browser.newContext({
     userAgent: UA,
     viewport: { width: 1366, height: 768 },
@@ -98,8 +106,17 @@ async function fetchHtmlPlain(url) {
 async function fetchHtmlBrowser(url) {
   const page = await getBrowserPage();
   await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
-  await page.waitForTimeout(2500); // let the challenge/content settle
-  return { status: 200, html: await page.content() };
+  await page.waitForTimeout(3000); // let the challenge/content settle
+  let html = await page.content();
+  if (extractProducts(html).length === 0) {
+    // Akamai challenge sometimes needs a follow-up navigation once the sensor
+    // cookie is set — one reload often turns a stub into the real page.
+    await page.waitForTimeout(2000);
+    await page.reload({ waitUntil: 'domcontentloaded', timeout: 45000 });
+    await page.waitForTimeout(3000);
+    html = await page.content();
+  }
+  return { status: 200, html };
 }
 
 async function fetchListingHtml(url, pageNo) {
