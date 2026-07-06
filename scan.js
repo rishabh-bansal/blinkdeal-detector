@@ -22,12 +22,13 @@ const KEYWORDS = (process.env.COUPON_KEYWORDS || 'blinkdeal')
   .toLowerCase().split(',').map((s) => s.trim()).filter(Boolean);
 const MAX_PAGES = parseInt(process.env.MAX_PAGES || '2', 10);
 
-// Retries per scan (fresh request each — helps when the block is probabilistic).
-const MAX_ATTEMPTS = parseInt(process.env.MAX_ATTEMPTS || '8', 10);
-const ATTEMPT_DELAY_MS = parseInt(process.env.ATTEMPT_DELAY_MS || '6000', 10);
-// When a deal is live, keep watching this long to catch the "stop".
-const MONITOR_MINUTES = parseFloat(process.env.MONITOR_MINUTES || '8');
-const MONITOR_INTERVAL_MS = parseInt(process.env.MONITOR_INTERVAL_MS || '60000', 10);
+// Attempts per job. Myntra's block is per-IP deterministic (verified: curl_cffi
+// with a perfect Chrome fingerprint got the same block on the same runner IP),
+// so retrying the SAME runner rarely helps — IP diversity is what matters. The
+// workflow gets that by fanning out across parallel runners (different IPs), so
+// each job just needs 1-2 quick tries.
+const MAX_ATTEMPTS = parseInt(process.env.MAX_ATTEMPTS || '2', 10);
+const ATTEMPT_DELAY_MS = parseInt(process.env.ATTEMPT_DELAY_MS || '3000', 10);
 
 const UAS = [
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
@@ -138,6 +139,10 @@ async function main() {
     process.exit(0);
   }
 
+  // Got through. Report current state — the Worker handles start/stop
+  // transitions + subscriber SMS. Frequent triggers (every 5 min active) catch
+  // both the deal appearing and clearing; one of the parallel runners getting
+  // through per trigger is enough.
   const deals = detect(products);
   try {
     const r = await report(deals, products.length);
@@ -151,25 +156,6 @@ async function main() {
       process.exit(1);
     }
     console.log(`[${started}] report error (transient): ${e.message}`);
-  }
-
-  // Deal is live → keep watching to catch the stop quickly.
-  if (deals.length > 0) {
-    const deadline = Date.now() + MONITOR_MINUTES * 60000;
-    console.log(`  monitoring for stop, up to ${MONITOR_MINUTES} min…`);
-    while (Date.now() < deadline) {
-      await sleep(MONITOR_INTERVAL_MS);
-      const { products: p2 } = await scanWithRetry(4);
-      if (!p2.length) continue; // blocked this cycle — keep waiting, no false stop
-      const d2 = detect(p2);
-      try {
-        const r2 = await report(d2, p2.length);
-        console.log(`[${new Date().toISOString()}] deals=${d2.length}${r2.cleared ? ' — CLEARED, stop sent' : ''}`);
-      } catch (e) {
-        console.log(`  monitor report error: ${e.message}`);
-      }
-      if (d2.length === 0) break; // cleared
-    }
   }
 
   process.exit(0);

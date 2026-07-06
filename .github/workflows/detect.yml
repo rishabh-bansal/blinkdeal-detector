@@ -5,22 +5,12 @@ on:
     # Tiered by the 100-day BLINKDEAL pattern data (sessions ~6 AM–9 PM IST,
     # near-zero overnight). GitHub cron is UTC; IST = UTC+5:30.
     #
-    # ACTIVE (~07:30–23:30 IST): check every 5 min
+    # ACTIVE (~07:30–23:30 IST): every 5 min
     - cron: "*/5 2-17 * * *"
-    # OFF-HOURS (23:30–07:30 IST): check every 30 min
+    # OFF-HOURS (23:30–07:30 IST): every 30 min
     - cron: "11,41 18-23 * * *"
     - cron: "11,41 0-1 * * *"
-  workflow_dispatch:
-    inputs:
-      max_attempts:
-        description: "Fetch attempts before giving up this run"
-        required: false
-        default: "8"
-
-# Never let two runs overlap (cron delays can stack runs).
-concurrency:
-  group: blinkdeal-detector
-  cancel-in-progress: true
+  workflow_dispatch: {}
 
 permissions:
   contents: read
@@ -28,19 +18,23 @@ permissions:
 jobs:
   detect:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 5
+    # Fan out across parallel runners — each gets a different IP. Myntra blocks
+    # ~75% of GitHub IPs, so 1 runner ≈ 25% catch/trigger; 4 runners ≈ 58%;
+    # across a 13-min deal's ~3 triggers that's ~93%. `fail-fast: false` so a
+    # blocked shard never cancels the shard that got through. Public repo =
+    # free parallel jobs.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Node
-        uses: actions/setup-node@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: "24"
-
-      - name: Run detector
+      - name: Run detector (shard ${{ matrix.shard }})
         env:
           REPORT_URL: https://blinkdeal.paype.co
           REPORT_KEY: ${{ secrets.REPORT_KEY }}
-          MAX_ATTEMPTS: ${{ github.event.inputs.max_attempts || '8' }}
         run: node scan.js
