@@ -1,12 +1,18 @@
-// BLINKDEAL detector — runs on GitHub Actions (burst mode).
+// BLINKDEAL detector — runs on GitHub Actions.
 //
-// Pattern proven by the reference repos: a scheduled workflow keeps this
-// process alive for ~13 minutes, checking Myntra every 60s, then exits and the
-// cron relaunches it. Each trustworthy scan is reported to the blinkdeal
-// Worker (blinkdeal.paype.co), which owns subscribers + SMS fan-out and only
-// notifies on deal transitions — so reporting every minute is safe.
+// Each scheduled run does one honest attempt to read Myntra's gold-coin
+// listing (with a few retries), reports any BLINKDEAL deal to the blinkdeal
+// Worker (blinkdeal.paype.co), and — if a deal is live — keeps polling for a
+// few minutes to catch when it clears. The Worker owns subscribers + SMS
+// fan-out and only notifies on transitions.
 //
-// Zero npm dependencies: Node 20+ built-in fetch only.
+// IMPORTANT: Myntra soft-blocks datacenter IPs (GitHub runners included) by
+// serving a ~480-byte "Site Maintenance" stub to a large fraction of requests.
+// A blocked run is an EXPECTED external condition, NOT a code failure — so we
+// exit 0 and never spam failure emails. We only exit non-zero for real config
+// errors (missing/invalid REPORT_KEY).
+//
+// Zero npm dependencies: Node built-in fetch only.
 import { extractProducts } from './extractProducts.js';
 
 const REPORT_URL = (process.env.REPORT_URL || 'https://blinkdeal.paype.co').replace(/\/$/, '');
@@ -15,39 +21,23 @@ const MYNTRA_URL = process.env.MYNTRA_URL || 'https://www.myntra.com/gold-coin';
 const KEYWORDS = (process.env.COUPON_KEYWORDS || 'blinkdeal')
   .toLowerCase().split(',').map((s) => s.trim()).filter(Boolean);
 const MAX_PAGES = parseInt(process.env.MAX_PAGES || '2', 10);
-const INTERVAL_SECONDS = parseInt(process.env.INTERVAL_SECONDS || '60', 10);
 
-// Burst duration. "auto" (default) uses the 100-day BLINKDEAL pattern data:
-// sessions start almost exclusively 6 AM–9 PM IST, so inside the active
-// window (07–23 IST) we run full 13-min bursts; overnight we do one quick
-// check and exit (the workflow cron also runs less often overnight).
-const ACTIVE_START_IST = parseInt(process.env.ACTIVE_START_IST || '7', 10);
-const ACTIVE_END_IST = parseInt(process.env.ACTIVE_END_IST || '23', 10);
+// Retries per scan (fresh request each — helps when the block is probabilistic).
+const MAX_ATTEMPTS = parseInt(process.env.MAX_ATTEMPTS || '8', 10);
+const ATTEMPT_DELAY_MS = parseInt(process.env.ATTEMPT_DELAY_MS || '6000', 10);
+// When a deal is live, keep watching this long to catch the "stop".
+const MONITOR_MINUTES = parseFloat(process.env.MONITOR_MINUTES || '8');
+const MONITOR_INTERVAL_MS = parseInt(process.env.MONITOR_INTERVAL_MS || '60000', 10);
 
-function istHour() {
-  return new Date(Date.now() + 330 * 60000).getUTCHours();
-}
+const UAS = [
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+];
 
-function resolveBurstMinutes() {
-  const raw = process.env.BURST_MINUTES || 'auto';
-  const n = parseFloat(raw);
-  if (Number.isFinite(n)) return { minutes: n, mode: 'explicit' };
-  // Auto mode = ONE check per run, always. Aggressive in-run bursts got the
-  // runner IPs reputation-blocked by Akamai (verified live); the reference
-  // repos survived months at one-check-per-run cadence. The workflow cron
-  // controls frequency (5 min active window / 30 min overnight). If a deal is
-  // found, the run auto-extends (see below) so stop-detection stays fast.
-  const h = istHour();
-  const active = h >= ACTIVE_START_IST && h < ACTIVE_END_IST;
-  return { minutes: 0.05, mode: active ? 'auto-active' : 'auto-offhours' };
-}
-
-const UA =
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
-
-function headers() {
+function headers(ua) {
   return {
-    'User-Agent': UA,
+    'User-Agent': ua,
     Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
     'Accept-Language': 'en-IN,en;q=0.9',
     'Upgrade-Insecure-Requests': '1',
@@ -59,89 +49,10 @@ function headers() {
   };
 }
 
-// ── Browser fallback ─────────────────────────────────────────────────────────
-// Plain fetch is sometimes served an Akamai challenge stub (~500 bytes) on
-// GitHub runners. Real Chrome executes the challenge and gets the page — the
-// approach the reference Blinkdeal repo ran successfully for months. We start
-// the browser lazily on first block and reuse it for the rest of the run.
-let browserCtx = null;
-let useBrowser = false;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function getBrowserPage() {
-  if (browserCtx) return browserCtx.page;
-  const { chromium } = await import('playwright');
-  const launchOpts = {
-    headless: true,
-    args: ['--disable-blink-features=AutomationControlled', '--no-sandbox', '--disable-dev-shm-usage'],
-  };
-  let browser;
-  try {
-    // Real Google Chrome — what the reference Blinkdeal repo ran for months.
-    // Chromium headless-shell gets detected by Akamai (verified: 481-byte stub).
-    browser = await chromium.launch({ ...launchOpts, channel: 'chrome' });
-  } catch {
-    browser = await chromium.launch(launchOpts); // fall back to bundled chromium
-  }
-  const context = await browser.newContext({
-    userAgent: UA,
-    viewport: { width: 1366, height: 768 },
-    locale: 'en-IN',
-  });
-  await context.addInitScript(
-    "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
-  );
-  const page = await context.newPage();
-  browserCtx = { browser, page };
-  return page;
-}
-
-export async function closeBrowser() {
-  if (browserCtx) {
-    await browserCtx.browser.close().catch(() => {});
-    browserCtx = null;
-  }
-}
-
-async function fetchHtmlPlain(url) {
-  const res = await fetch(url, { headers: headers(), redirect: 'follow', signal: AbortSignal.timeout(20000) });
-  const html = await res.text();
-  return { status: res.status, html };
-}
-
-async function fetchHtmlBrowser(url) {
-  const page = await getBrowserPage();
-  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
-  await page.waitForTimeout(3000); // let the challenge/content settle
-  let html = await page.content();
-  if (extractProducts(html).length === 0) {
-    // Akamai challenge sometimes needs a follow-up navigation once the sensor
-    // cookie is set — one reload often turns a stub into the real page.
-    await page.waitForTimeout(2000);
-    await page.reload({ waitUntil: 'domcontentloaded', timeout: 45000 });
-    await page.waitForTimeout(3000);
-    html = await page.content();
-  }
-  return { status: 200, html };
-}
-
-async function fetchListingHtml(url, pageNo) {
-  if (!useBrowser) {
-    const r = await fetchHtmlPlain(url);
-    if (extractProducts(r.html).length > 0) return r;
-    console.log(`  [scan] plain fetch blocked on page ${pageNo} (HTTP ${r.status}, len=${r.html.length}) — switching to browser`);
-    try {
-      useBrowser = true;
-      return await fetchHtmlBrowser(url);
-    } catch (e) {
-      useBrowser = false; // playwright unavailable (e.g. local run) — stay on fetch
-      console.log(`  [scan] browser fallback unavailable: ${e.message.split('\n')[0]}`);
-      return r;
-    }
-  }
-  return fetchHtmlBrowser(url);
-}
-
-async function scan() {
+// One pass over the listing pages. Returns [] if blocked/empty.
+async function scanOnce(ua) {
   const all = [];
   const seen = new Set();
   for (let page = 1; page <= MAX_PAGES; page++) {
@@ -149,20 +60,13 @@ async function scan() {
     const url = page === 1 ? MYNTRA_URL : `${MYNTRA_URL}${sep}p=${page}`;
     let html = '';
     try {
-      ({ html } = await fetchListingHtml(url, page));
-    } catch (e) {
-      console.log(`  [scan] page ${page} fetch failed: ${e.message.split('\n')[0]}`);
+      const res = await fetch(url, { headers: headers(ua), redirect: 'follow', signal: AbortSignal.timeout(20000) });
+      html = await res.text();
+    } catch {
       break;
     }
     const products = extractProducts(html);
-    if (!products.length) {
-      if (page === 1) {
-        console.log(`  [scan] page 1 len=${html.length}, no products (mode=${useBrowser ? 'browser' : 'fetch'})`);
-        // Diagnostic: what did the block page actually say?
-        console.log(`  [scan] page head: ${html.slice(0, 250).replace(/\s+/g, ' ')}`);
-      }
-      break;
-    }
+    if (!products.length) break;
     let added = 0;
     for (const p of products) {
       const id = String(p.productId ?? p.id ?? '');
@@ -172,6 +76,17 @@ async function scan() {
     if (!added) break;
   }
   return all;
+}
+
+// Retry the scan until we get real products or run out of attempts.
+async function scanWithRetry(maxAttempts) {
+  for (let i = 0; i < maxAttempts; i++) {
+    const ua = UAS[i % UAS.length];
+    const products = await scanOnce(ua);
+    if (products.length) return { products, attempts: i + 1 };
+    if (i < maxAttempts - 1) await sleep(ATTEMPT_DELAY_MS);
+  }
+  return { products: [], attempts: maxAttempts };
 }
 
 function detect(products) {
@@ -210,53 +125,54 @@ async function report(deals, productsSeen) {
 async function main() {
   if (!REPORT_KEY) {
     console.error('REPORT_KEY missing — set the Actions secret.');
-    process.exit(1);
+    process.exit(1); // genuine config error → worth surfacing
   }
-  const { minutes: burstMinutes, mode } = resolveBurstMinutes();
-  const jobStart = Date.now();
-  let deadline = jobStart + burstMinutes * 60 * 1000;
-  // Never exceed the workflow's 15-min job timeout, even after extensions.
-  const hardCap = jobStart + 14 * 60 * 1000;
-  console.log(`Burst monitor [${mode}]: ${burstMinutes} min, every ${INTERVAL_SECONDS}s, keywords=[${KEYWORDS}] (IST hour ${istHour()})`);
 
-  let cycles = 0, blockedCycles = 0;
-  while (Date.now() < deadline) {
-    cycles++;
-    const t0 = Date.now();
-    try {
-      const products = await scan();
-      const deals = detect(products);
-      if (products.length === 0) {
-        blockedCycles++;
-        console.log(`[${new Date().toISOString()}] 0 products (blocked/empty) — not reported`);
-      } else {
-        const r = await report(deals, products.length);
-        const note = deals.length
-          ? ` 🟢 DEAL x${deals.length} (worker: new=${r.newCount}, notified=${r.notifiedCount})`
-          : r.cleared ? ' (worker: cleared, stop sent)' : '';
-        console.log(`[${new Date().toISOString()}] products=${products.length} deals=${deals.length}${note}`);
-        // A deal is live: keep tracking it (fast stop detection) even if this
-        // run started as a quick off-hours check — up to the job's hard cap.
-        if (deals.length > 0) {
-          deadline = Math.min(Math.max(deadline, Date.now() + 5 * 60 * 1000), hardCap);
-        }
-      }
-    } catch (e) {
-      console.log(`[${new Date().toISOString()}] cycle error: ${e.message}`);
-      if (/REPORT_KEY rejected/.test(e.message)) process.exit(1);
+  const started = new Date().toISOString();
+  const { products, attempts } = await scanWithRetry(MAX_ATTEMPTS);
+
+  if (products.length === 0) {
+    // Myntra served the maintenance stub to this runner's IP on every attempt.
+    // Expected for datacenter IPs — NOT a failure. Exit 0 so no email is sent.
+    console.log(`[${started}] blocked after ${attempts} attempts (Myntra maintenance stub to this runner IP) — skipping. Not a failure.`);
+    process.exit(0);
+  }
+
+  const deals = detect(products);
+  try {
+    const r = await report(deals, products.length);
+    const note = deals.length
+      ? ` 🟢 DEAL x${deals.length} (worker: new=${r.newCount}, notified=${r.notifiedCount})`
+      : r.cleared ? ' (worker: cleared, stop sent)' : '';
+    console.log(`[${started}] products=${products.length} attempts=${attempts} deals=${deals.length}${note}`);
+  } catch (e) {
+    if (/REPORT_KEY rejected/.test(e.message)) {
+      console.error(e.message);
+      process.exit(1);
     }
-    const elapsed = Date.now() - t0;
-    const sleep = Math.max(0, INTERVAL_SECONDS * 1000 - elapsed);
-    if (Date.now() + sleep >= deadline) break;
-    await new Promise((r) => setTimeout(r, sleep));
+    console.log(`[${started}] report error (transient): ${e.message}`);
   }
 
-  console.log(`Burst done: ${cycles} cycles, ${blockedCycles} blocked/empty (mode=${useBrowser ? 'browser' : 'fetch'}).`);
-  await closeBrowser();
-  if (cycles > 0 && blockedCycles === cycles) {
-    console.error('EVERY cycle returned 0 products — Myntra may be blocking this runner. Investigate.');
-    process.exit(2); // surface as a failed run so it's visible
+  // Deal is live → keep watching to catch the stop quickly.
+  if (deals.length > 0) {
+    const deadline = Date.now() + MONITOR_MINUTES * 60000;
+    console.log(`  monitoring for stop, up to ${MONITOR_MINUTES} min…`);
+    while (Date.now() < deadline) {
+      await sleep(MONITOR_INTERVAL_MS);
+      const { products: p2 } = await scanWithRetry(4);
+      if (!p2.length) continue; // blocked this cycle — keep waiting, no false stop
+      const d2 = detect(p2);
+      try {
+        const r2 = await report(d2, p2.length);
+        console.log(`[${new Date().toISOString()}] deals=${d2.length}${r2.cleared ? ' — CLEARED, stop sent' : ''}`);
+      } catch (e) {
+        console.log(`  monitor report error: ${e.message}`);
+      }
+      if (d2.length === 0) break; // cleared
+    }
   }
+
+  process.exit(0);
 }
 
 main();

@@ -2,10 +2,8 @@ name: BLINKDEAL Detector
 
 on:
   schedule:
-    # One check per run (in-run bursts got runner IPs blocked by Akamai; the
-    # reference repos survived months at this cadence). Tiered by the 100-day
-    # BLINKDEAL pattern data (sessions ~6 AM–9 PM IST, near-zero overnight).
-    # GitHub cron is UTC; IST = UTC+5:30.
+    # Tiered by the 100-day BLINKDEAL pattern data (sessions ~6 AM–9 PM IST,
+    # near-zero overnight). GitHub cron is UTC; IST = UTC+5:30.
     #
     # ACTIVE (~07:30–23:30 IST): check every 5 min
     - cron: "*/5 2-17 * * *"
@@ -14,16 +12,12 @@ on:
     - cron: "11,41 0-1 * * *"
   workflow_dispatch:
     inputs:
-      burst_minutes:
-        description: "Burst length in minutes, or 'auto' (IST-aware)"
+      max_attempts:
+        description: "Fetch attempts before giving up this run"
         required: false
-        default: "auto"
-      interval_seconds:
-        description: "Seconds between checks"
-        required: false
-        default: "60"
+        default: "8"
 
-# Never let two bursts overlap (cron delays can stack runs).
+# Never let two runs overlap (cron delays can stack runs).
 concurrency:
   group: blinkdeal-detector
   cancel-in-progress: true
@@ -34,7 +28,7 @@ permissions:
 jobs:
   detect:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 12
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -42,26 +36,11 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "24"
 
-      # Real Chrome fallback for when plain fetch gets an Akamai challenge stub
-      # (the reference Blinkdeal repo ran this way for months). Cached so most
-      # runs skip the download.
-      - name: Cache Playwright browsers
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/ms-playwright
-          key: playwright-chromium-${{ runner.os }}
-
-      - name: Install Playwright + real Chrome
-        run: |
-          npm install --no-save playwright
-          npx playwright install --with-deps chrome || npx playwright install --with-deps chromium
-
-      - name: Run burst monitor
+      - name: Run detector
         env:
           REPORT_URL: https://blinkdeal.paype.co
           REPORT_KEY: ${{ secrets.REPORT_KEY }}
-          BURST_MINUTES: ${{ github.event.inputs.burst_minutes || 'auto' }}
-          INTERVAL_SECONDS: ${{ github.event.inputs.interval_seconds || '60' }}
+          MAX_ATTEMPTS: ${{ github.event.inputs.max_attempts || '8' }}
         run: node scan.js
