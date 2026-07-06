@@ -1,0 +1,18 @@
+name: Myntra Fetch Diagnostic
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install curl_cffi
+        run: pip install curl_cffi
+      - name: Run diagnostic
+        run: python diag.py
