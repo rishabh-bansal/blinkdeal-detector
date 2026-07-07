@@ -94,12 +94,26 @@ function detect(products) {
   const deals = [];
   for (const p of products) {
     const cd = p.couponData || {};
-    const coupon = [cd.couponDescription, cd.description, cd.couponText, cd.label, p.offerText]
-      .filter(Boolean).join(' ');
+    // Match against the ENTIRE couponData JSON — robust to Myntra's structure
+    // changes. The coupon code (e.g. BLINKDEAL6) lives in couponData.tagLink
+    // ("Coupons:BLINKDEAL6_…") and couponData.couponDescription.couponCode,
+    // and couponDescription flipped from a string to a nested object.
     const title = p.product || p.productName || '';
-    const hay = `${title} ${coupon}`.toLowerCase();
+    const hay = `${title} ${JSON.stringify(cd)}`.toLowerCase();
     const matched = KEYWORDS.find((k) => hay.includes(k));
     if (!matched) continue;
+
+    // Build a human-readable coupon label for the alert/log.
+    const desc = cd.couponDescription;
+    let coupon = '';
+    if (desc && typeof desc === 'object') {
+      coupon = [desc.couponCode, desc.bestPrice ? `best ₹${desc.bestPrice}` : '']
+        .filter(Boolean).join(' ');
+    } else if (typeof desc === 'string') {
+      coupon = desc;
+    }
+    if (!coupon) coupon = matched.toUpperCase();
+
     const landing = String(p.landingPageUrl || '').replace(/^\//, '');
     deals.push({
       id: String(p.productId ?? ''),
