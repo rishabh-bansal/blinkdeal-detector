@@ -16,7 +16,7 @@
 // Zero npm dependencies: Node 18+ built-in fetch only.
 import { extractProductsWithMeta } from './extractProducts.js';
 
-export const SCAN_VERSION = '2.2.0'; // sent with every report so you can tell which code a reporter runs
+export const SCAN_VERSION = '2.2.1'; // sent with every report so you can tell which code a reporter runs
 const REPORT_URL = (process.env.REPORT_URL || 'https://blinkdeal.paype.co').replace(/\/$/, '');
 const REPORT_KEY = process.env.REPORT_KEY || '';
 const REPORTER_ID = (process.env.REPORTER_ID || 'unknown').slice(0, 20);
@@ -171,9 +171,19 @@ export function detect(products) {
   return deals;
 }
 
-// Reliable report. Retries 429/5xx with backoff; treats 401/403 as fatal config
-// errors; throws on any non-2xx so the caller can decide (an undelivered DEAL is
-// fatal). Redirects disabled so the x-admin-key is never forwarded to another host.
+// Reliable report. Retries 429/5xx/403 with backoff; throws on any non-2xx so
+// the caller can decide (an undelivered DEAL is fatal). Redirects disabled so
+// the x-admin-key is never forwarded to another host.
+//
+// 401 vs 403 are NOT the same thing and must not be conflated: our own Worker
+// code only ever returns 401 for a bad/missing key (see blinkdeal-worker
+// src/index.js /api/report auth check) — it never returns 403 for that route.
+// A 403 therefore means something IN FRONT of the Worker (Cloudflare's own
+// edge WAF / Bot Fight Mode) rejected the request before it reached our auth
+// check at all — almost certainly because GitHub Actions' runner IP is a
+// well-known datacenter range that Cloudflare's bot heuristics flag. That is
+// NOT a "wrong key" problem, so it must not be reported or treated as one
+// (rotating the key would do nothing) — see REPORT_EDGE_BLOCKED below.
 //
 // `kind` picks the expected ack SHAPE so a heartbeat-shaped ack can't slip
 // through as a deal-report success or vice versa:
@@ -186,7 +196,14 @@ async function report(body, kind = 'deal') {
     try {
       res = await fetch(`${REPORT_URL}/api/report`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json', 'x-admin-key': REPORT_KEY },
+        headers: {
+          'content-type': 'application/json',
+          'x-admin-key': REPORT_KEY,
+          // A browser-like UA may reduce the odds of edge bot-heuristics
+          // flagging this request (see note above) — best-effort, not a fix
+          // for IP-reputation-based blocking, which no header can bypass.
+          'user-agent': UAS[0],
+        },
         body: JSON.stringify({ ...body, reporter: REPORTER_ID, version: SCAN_VERSION }),
         redirect: 'error',
         signal: AbortSignal.timeout(30000),
@@ -196,8 +213,15 @@ async function report(body, kind = 'deal') {
       if (attempt < 2) { await sleep(2000 * (attempt + 1)); continue; }
       throw lastErr;
     }
-    if (res.status === 401 || res.status === 403) {
-      throw new Error(`REPORT_KEY rejected (${res.status}) — fatal config error`);
+    if (res.status === 401) {
+      throw new Error(`REPORT_KEY rejected (401 from our Worker) — fatal config error, check the secret`);
+    }
+    if (res.status === 403) {
+      // Likely Cloudflare edge (WAF/bot), not our Worker — retry a couple
+      // times (bot-scoring can be probabilistic), then surface distinctly.
+      lastErr = new Error('REPORT_EDGE_BLOCKED');
+      if (attempt < 2) { await sleep(2000 * (attempt + 1)); continue; }
+      throw lastErr;
     }
     if (res.status === 429 || res.status >= 500) {
       lastErr = new Error(`report failed ${res.status}`);
@@ -226,14 +250,27 @@ async function report(body, kind = 'deal') {
 }
 
 // Heartbeat so /api/stats can tally block/http/network/parse/fallback-empty
-// outcomes. A fatal auth failure (401/403) is rethrown so a wrong key surfaces
-// even on a blocked scan; transient heartbeat failures are swallowed
-// (stats-only, not critical).
+// outcomes. A fatal AUTH failure (real 401 from our Worker) is rethrown so a
+// wrong key surfaces even on a blocked scan. An edge block (403, likely
+// Cloudflare's own bot protection rejecting the runner's IP — see report())
+// is logged loudly but treated as non-fatal: it's an external condition we
+// can't self-report (the reporting channel IS what's blocked), so exiting
+// non-zero here would just recreate the failure-email spam round 1 fixed,
+// for a different underlying reason. It's visible in THIS run's console log.
 async function heartbeat(outcome) {
   try {
     await report({ heartbeat: true, outcome }, 'heartbeat');
   } catch (e) {
     if (/fatal config/.test(e.message)) throw e;
+    if (/REPORT_EDGE_BLOCKED/.test(e.message)) {
+      console.error(
+        `  ⚠️  [heartbeat ${outcome}] REPORT itself was rejected with 403 — this is ` +
+        `almost certainly Cloudflare's edge (WAF/Bot Fight Mode) blocking this runner's ` +
+        `IP on blinkdeal.paype.co, NOT a REPORT_KEY problem. Check the Cloudflare dashboard: ` +
+        `paype.co zone → Security → Events, for a rule matching GitHub Actions' IP range.`
+      );
+      return;
+    }
     console.log(`  [heartbeat ${outcome}] failed (non-fatal): ${e.message}`);
   }
 }
@@ -299,10 +336,21 @@ async function main() {
     console.log(`[${ts}] products=${r.products.length} attempts=${r.attempts} deals=${deals.length}${note}${r.exact ? '' : ' (fallback-extraction)'}`);
     process.exit(0);
   } catch (e) {
-    // ANY authoritative report that couldn't be delivered fails the run — a
-    // failed `deals: []` may be the critical STOP transition just as much as a
-    // failed deal alert. The worker's staleness guard is a backstop, not a
-    // reason to hide the delivery failure.
+    if (/REPORT_EDGE_BLOCKED/.test(e.message)) {
+      // Cloudflare's own edge rejected this (see report()'s note), not our
+      // code and not fixable by retrying — exiting 1 here would just recreate
+      // the failure-email spam round 1 fixed, for a persistent external cause.
+      console.error(
+        `[${ts}] ⚠️  report REJECTED AT THE CLOUDFLARE EDGE (403) — deals=${deals.length} could NOT be delivered. ` +
+        `This is almost certainly Bot Fight Mode / WAF blocking this runner's IP on blinkdeal.paype.co, not a code bug. ` +
+        `Check paype.co zone → Security → Events in the Cloudflare dashboard. The Pi (primary reporter) is unaffected.`
+      );
+      process.exit(0);
+    }
+    // ANY OTHER authoritative report that couldn't be delivered fails the run
+    // — a failed `deals: []` may be the critical STOP transition just as much
+    // as a failed deal alert. The worker's staleness guard is a backstop, not
+    // a reason to hide a genuine (non-edge-block) delivery failure.
     console.error(`[${ts}] report delivery failed: ${e.message}`);
     process.exit(1);
   }

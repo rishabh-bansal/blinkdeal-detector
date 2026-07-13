@@ -1,6 +1,6 @@
 {
   "name": "blinkdeal-detector",
-  "version": "2.2.0",
+  "version": "2.2.1",
   "private": true,
   "type": "module",
   "description": "Reads Myntra gold-coin listings and reports BLINKDEAL deals to blinkdeal.paype.co. Run on a residential IP (Pi/laptop) every 5 min.",
