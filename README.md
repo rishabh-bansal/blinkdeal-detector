@@ -41,10 +41,11 @@ residential reporter has gone quiet (no report in ~15 min) — investigate.
 
 ## Behaviour / guarantees
 
-- Fetches `?rows=100` — the max the page inlines (~94 of ~318 coins). `?p=`
-  pagination does **not** work (Myntra returns the same batch); full coverage
-  needs the authenticated search API. BLINKDEAL is category-wide, so the top ~94
-  catch it; a product-specific coupon beyond #94 could be missed.
+- Checks **"is BLINKDEAL live?"**, not the full catalogue. It fetches the default
+  listing (~44 coins in one request) and looks for the coupon. BLINKDEAL is a
+  category-wide coupon (attached to ~all coins), so ~44 is plenty — no pagination
+  needed. (A hypothetical product-specific coupon on a low-ranked coin could be
+  missed, but BLINKDEAL isn't that.)
 - **Typed scan outcomes**: only a verified "Site Maintenance" page counts as an
   expected `blocked`. `http-error`, `network-error`, and `parse-error` are logged
   distinctly and heartbeat to `/api/stats` — a broken scan is never mistaken for

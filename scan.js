@@ -9,10 +9,9 @@
 //   - We distinguish that verified block from genuine failures (HTTP errors,
 //     network errors, schema/parse regressions) so real problems are visible and
 //     a broken scan is NEVER mistaken for a "cleared deal".
-//   - The embedded JSON returns at most ~94 of the ~318 gold coins (rows=100 is
-//     the max the page inlines; the rest need the authenticated search API).
-//     BLINKDEAL is a category-wide coupon (seen on ~all coins), so the top ~94
-//     catch it; a product-specific coupon beyond #94 could be missed.
+//   - We only check "is BLINKDEAL live?", not the full catalogue. BLINKDEAL is a
+//     category-wide coupon (attached to ~all gold coins), so the ~44 coins the
+//     default listing inlines in one request are plenty to detect it.
 //
 // Zero npm dependencies: Node 18+ built-in fetch only.
 import { extractProducts } from './extractProducts.js';
@@ -21,8 +20,6 @@ const REPORT_URL = (process.env.REPORT_URL || 'https://blinkdeal.paype.co').repl
 const REPORT_KEY = process.env.REPORT_KEY || '';
 const REPORTER_ID = (process.env.REPORTER_ID || 'unknown').slice(0, 20);
 const MYNTRA_URL = process.env.MYNTRA_URL || 'https://www.myntra.com/gold-coin';
-// rows=100 pulls the max the listing inlines (~94). Higher values return 0.
-const ROWS = 100;
 const KEYWORDS = (process.env.COUPON_KEYWORDS || 'blinkdeal')
   .toLowerCase().split(',').map((s) => s.trim()).filter(Boolean);
 const MAX_ATTEMPTS = intEnv('MAX_ATTEMPTS', 2, 1, 10);
@@ -73,8 +70,10 @@ function isMaintenanceStub(html) {
 //   { outcome: 'network-error', detail }
 //   { outcome: 'parse-error', detail } 200 OK but no products structure found
 async function scanOnce(ua) {
-  const sep = MYNTRA_URL.includes('?') ? '&' : '?';
-  const url = `${MYNTRA_URL}${sep}rows=${ROWS}`;
+  // The default listing inlines ~44 gold coins in one request — plenty to detect
+  // a category-wide coupon like BLINKDEAL (it's attached to ~all coins). We don't
+  // paginate: we're answering "is BLINKDEAL live?", not cataloguing all products.
+  const url = MYNTRA_URL;
   let res;
   try {
     res = await fetch(url, {
