@@ -17,6 +17,8 @@ import { extractProducts } from './extractProducts.js';
 
 const REPORT_URL = (process.env.REPORT_URL || 'https://blinkdeal.paype.co').replace(/\/$/, '');
 const REPORT_KEY = process.env.REPORT_KEY || '';
+// Identifies who's reporting (pi / github / laptop), for working/blocked stats.
+const REPORTER_ID = process.env.REPORTER_ID || 'unknown';
 const MYNTRA_URL = process.env.MYNTRA_URL || 'https://www.myntra.com/gold-coin';
 const KEYWORDS = (process.env.COUPON_KEYWORDS || 'blinkdeal')
   .toLowerCase().split(',').map((s) => s.trim()).filter(Boolean);
@@ -129,12 +131,26 @@ async function report(deals, productsSeen) {
   const res = await fetch(`${REPORT_URL}/api/report`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', 'x-admin-key': REPORT_KEY },
-    body: JSON.stringify({ productsSeen, deals }),
+    body: JSON.stringify({ productsSeen, deals, reporter: REPORTER_ID }),
     signal: AbortSignal.timeout(30000),
   });
   const body = await res.json().catch(() => ({}));
   if (res.status === 401) throw new Error('REPORT_KEY rejected by worker (401) — check the Actions secret');
   return { status: res.status, ...body };
+}
+
+// Tell the worker this scan was blocked (Akamai maintenance stub), for stats.
+async function reportBlocked() {
+  try {
+    await fetch(`${REPORT_URL}/api/report`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-admin-key': REPORT_KEY },
+      body: JSON.stringify({ blocked: true, reporter: REPORTER_ID }),
+      signal: AbortSignal.timeout(15000),
+    });
+  } catch {
+    /* best-effort */
+  }
 }
 
 async function main() {
@@ -148,8 +164,9 @@ async function main() {
 
   if (products.length === 0) {
     // Myntra served the maintenance stub to this runner's IP on every attempt.
-    // Expected for datacenter IPs — NOT a failure. Exit 0 so no email is sent.
-    console.log(`[${started}] blocked after ${attempts} attempts (Myntra maintenance stub to this runner IP) — skipping. Not a failure.`);
+    // Expected for datacenter IPs — NOT a failure. Log the block, exit 0.
+    console.log(`[${started}] blocked after ${attempts} attempts (Myntra maintenance stub to ${REPORTER_ID}) — skipping. Not a failure.`);
+    await reportBlocked();
     process.exit(0);
   }
 

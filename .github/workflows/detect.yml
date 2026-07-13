@@ -37,4 +37,5 @@ jobs:
         env:
           REPORT_URL: https://blinkdeal.paype.co
           REPORT_KEY: ${{ secrets.REPORT_KEY }}
+          REPORTER_ID: github
         run: node scan.js
