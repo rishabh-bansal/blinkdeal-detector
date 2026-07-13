@@ -45,3 +45,20 @@ test('entries without productId+price are rejected (analytics-style)', () => {
   // id+name but no productId/price → not a Myntra product → nothing found → null
   assert.equal(extractProducts('<script>x={"products":[{"id":"A","name":"x","quantity":1}]}</script>'), null);
 });
+
+test('EMPTY products array is NOT a success — returns null (no false clear)', () => {
+  // dataLayer.products:[] must never look like a valid "no deals" scan.
+  assert.equal(extractProducts('<script>dataLayer={"products":[]}</script>'), null);
+  assert.equal(extractProducts(myx([])), null);
+});
+
+test('exact searchData path is preferred over a larger competing array', () => {
+  const html =
+    '<script>window.__myx={"plaProducts":' +
+    JSON.stringify([P(1, 1), P(2, 2), P(3, 3), P(4, 4)]) + // bigger, but wrong
+    ',"searchData":{"results":{"products":' +
+    JSON.stringify([P(111, 9900)]) + '}}}</script>';
+  const out = extractProducts(html);
+  assert.equal(out.length, 1);
+  assert.equal(out[0].productId, 111); // the real one, not the bigger plaProducts
+});

@@ -56,9 +56,10 @@ function validCount(arr) {
   return n;
 }
 
-// DFS a parsed object for the array that looks most like Myntra's product list.
-// Prefers a value under a `products` key; otherwise the array with the most
-// valid products. Returns { arr, valid, viaProductsKey } or null.
+// DFS fallback for the array with the MOST valid products. Only ever considers
+// arrays that contain at least one real product — an empty array (e.g. an
+// analytics `dataLayer.products: []`) is never a candidate, so it can't be
+// mistaken for a genuine "no deals" result.
 function bestProductArray(root) {
   let best = null;
   const seen = new Set();
@@ -68,16 +69,7 @@ function bestProductArray(root) {
     seen.add(node);
     if (Array.isArray(node)) {
       const valid = validCount(node);
-      const viaKey = key === 'products';
-      if (valid > 0 || (viaKey && node.length === 0)) {
-        if (
-          !best ||
-          valid > best.valid ||
-          (valid === best.valid && viaKey && !best.viaProductsKey)
-        ) {
-          best = { arr: node, valid, viaProductsKey: viaKey };
-        }
-      }
+      if (valid > 0 && (!best || valid > best.valid)) best = { arr: node, valid };
       for (const item of node) visit(item, key, depth + 1);
       return;
     }
@@ -104,7 +96,8 @@ function parseMyxBlob(html) {
   return null;
 }
 
-// Fallback: parse each `"products":[ … ]` occurrence and keep the best.
+// Fallback: parse each `"products":[ … ]` occurrence and keep the one with the
+// most valid products. Empty arrays are never accepted.
 function scanProductsKey(html) {
   const key = '"products"';
   let from = 0;
@@ -126,24 +119,38 @@ function scanProductsKey(html) {
     }
     if (!Array.isArray(arr)) continue;
     const valid = validCount(arr);
-    if ((valid > 0 || arr.length === 0) && (!best || valid > best.valid)) {
-      best = { arr, valid };
-    }
+    if (valid > 0 && (!best || valid > best.valid)) best = { arr, valid };
   }
   return best;
 }
 
 /**
- * Returns validated product objects, or null if no products structure was found.
+ * Returns validated product objects, or NULL if a real, non-empty product list
+ * could not be located. NULL means "couldn't read the page" (block / error /
+ * schema change) — callers must treat it as unknown, never as "no deals".
+ *
+ * An empty array is NEVER returned as success: for the gold-coin listing an
+ * empty result is always a block/error, and returning [] would false-clear an
+ * active deal. So we require at least one valid product.
  */
 export function extractProducts(html) {
   if (!html || typeof html !== 'string') return null;
 
-  let candidate = null;
   const myx = parseMyxBlob(html);
-  if (myx) candidate = bestProductArray(myx);
-  if (!candidate) candidate = scanProductsKey(html);
-  if (!candidate) return null;
+  if (myx) {
+    // Prefer Myntra's exact, known search-results path. This avoids ever
+    // selecting a competing array (plaProducts, recommendations, dataLayer).
+    const exact = myx?.searchData?.results?.products;
+    if (Array.isArray(exact)) {
+      const valid = exact.filter(isValidProduct);
+      return valid.length > 0 ? valid : null; // present-but-empty ⇒ block/error
+    }
+    // Exact path absent (structure changed) → largest valid array as a fallback.
+    const best = bestProductArray(myx);
+    if (best) return best.arr.filter(isValidProduct);
+  }
 
-  return candidate.arr.filter(isValidProduct);
+  const b = scanProductsKey(html);
+  if (b) return b.arr.filter(isValidProduct);
+  return null;
 }

@@ -16,25 +16,31 @@
 // Zero npm dependencies: Node 18+ built-in fetch only.
 import { extractProducts } from './extractProducts.js';
 
+const SCAN_VERSION = '2.1.0'; // sent with every report so you can tell which code a reporter runs
 const REPORT_URL = (process.env.REPORT_URL || 'https://blinkdeal.paype.co').replace(/\/$/, '');
 const REPORT_KEY = process.env.REPORT_KEY || '';
 const REPORTER_ID = (process.env.REPORTER_ID || 'unknown').slice(0, 20);
 const MYNTRA_URL = process.env.MYNTRA_URL || 'https://www.myntra.com/gold-coin';
 const KEYWORDS = (process.env.COUPON_KEYWORDS || 'blinkdeal')
   .toLowerCase().split(',').map((s) => s.trim()).filter(Boolean);
-const MAX_ATTEMPTS = intEnv('MAX_ATTEMPTS', 2, 1, 10);
-const ATTEMPT_DELAY_MS = intEnv('ATTEMPT_DELAY_MS', 3000, 0, 60000);
 
 function intEnv(name, def, min, max) {
   const raw = process.env[name];
   if (raw === undefined || raw === '') return def;
+  if (!/^\d+$/.test(raw.trim())) {
+    console.error(`Invalid ${name}=${JSON.stringify(raw)} (expected a plain integer ${min}–${max}).`);
+    process.exit(1);
+  }
   const n = parseInt(raw, 10);
-  if (!Number.isFinite(n) || n < min || n > max) {
-    console.error(`Invalid ${name}=${JSON.stringify(raw)} (expected integer ${min}–${max}).`);
-    process.exit(1); // config error — surface it, don't silently misbehave
+  if (n < min || n > max) {
+    console.error(`Invalid ${name}=${JSON.stringify(raw)} (out of range ${min}–${max}).`);
+    process.exit(1);
   }
   return n;
 }
+
+const MAX_ATTEMPTS = intEnv('MAX_ATTEMPTS', 2, 1, 10);
+const ATTEMPT_DELAY_MS = intEnv('ATTEMPT_DELAY_MS', 3000, 0, 60000);
 
 const UAS = [
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
@@ -116,17 +122,32 @@ async function scanWithRetry() {
   return last;
 }
 
-function detect(products) {
+// Build a safe product URL: only accept an absolute landingPageUrl if it is
+// https on a myntra.com host; otherwise treat it as a relative path. Never
+// produce a link to an arbitrary external host.
+export function safeMyntraUrl(landing) {
+  const s = String(landing || '');
+  if (/^https?:\/\//i.test(s)) {
+    try {
+      const u = new URL(s);
+      if (u.protocol === 'https:' && /(^|\.)myntra\.com$/i.test(u.hostname)) return u.toString();
+    } catch { /* fall through */ }
+    return 'https://www.myntra.com/gold-coin';
+  }
+  return `https://www.myntra.com/${s.replace(/^\//, '')}`;
+}
+
+export function detect(products) {
   const deals = [];
   for (const p of products) {
     const id = String(p.productId ?? p.id ?? '').trim();
     if (!id) continue; // no stable id → can't dedup/report meaningfully
+
+    // Match ONLY the coupon-bearing fields — never the product title. A coin
+    // whose name happens to contain "BLINKDEAL" must not false-positive, and a
+    // coupon in `offerText` must not be missed.
     const cd = p.couponData || {};
-    // Match against the whole couponData JSON — robust to Myntra's structure
-    // changes. Code (e.g. BLINKDEAL6) lives in couponData.tagLink and
-    // couponData.couponDescription.couponCode; couponDescription is now an object.
-    const title = p.product || p.productName || '';
-    const hay = `${title} ${JSON.stringify(cd)}`.toLowerCase();
+    const hay = `${JSON.stringify(cd)} ${p.offerText || ''}`.toLowerCase();
     const matched = KEYWORDS.find((k) => hay.includes(k));
     if (!matched) continue;
 
@@ -140,12 +161,12 @@ function detect(products) {
     }
     if (!coupon) coupon = matched.toUpperCase();
 
-    const landing = String(p.landingPageUrl || '');
-    const url = /^https?:\/\//i.test(landing)
-      ? landing
-      : `https://www.myntra.com/${landing.replace(/^\//, '')}`;
-
-    deals.push({ id, title, coupon: coupon.slice(0, 160), url: url.slice(0, 500) });
+    deals.push({
+      id,
+      title: String(p.product || p.productName || '').slice(0, 200),
+      coupon: coupon.slice(0, 160),
+      url: safeMyntraUrl(p.landingPageUrl).slice(0, 500),
+    });
   }
   return deals;
 }
@@ -161,7 +182,7 @@ async function report(body) {
       res = await fetch(`${REPORT_URL}/api/report`, {
         method: 'POST',
         headers: { 'content-type': 'application/json', 'x-admin-key': REPORT_KEY },
-        body: JSON.stringify({ ...body, reporter: REPORTER_ID }),
+        body: JSON.stringify({ ...body, reporter: REPORTER_ID, version: SCAN_VERSION }),
         redirect: 'error',
         signal: AbortSignal.timeout(30000),
       });
@@ -179,17 +200,32 @@ async function report(body) {
       throw lastErr;
     }
     if (!res.ok) throw new Error(`report failed ${res.status}`);
-    return res.json().catch(() => ({}));
+    // A 2xx is not enough — validate the worker actually acknowledged with the
+    // expected JSON shape. A stray 200 text/html (proxy/error page) is a failure.
+    const ct = res.headers.get('content-type') || '';
+    let ack;
+    try {
+      ack = ct.includes('application/json') ? await res.json() : JSON.parse(await res.text());
+    } catch {
+      throw new Error('report ack was not JSON');
+    }
+    if (!ack || typeof ack !== 'object' || (typeof ack.ts !== 'string' && ack.ok !== true)) {
+      throw new Error(`report ack missing expected fields: ${JSON.stringify(ack).slice(0, 80)}`);
+    }
+    return ack;
   }
   throw lastErr;
 }
 
-// Best-effort heartbeat so /api/stats can tally block/http/network/parse outcomes.
+// Heartbeat so /api/stats can tally block/http/network/parse outcomes. A fatal
+// auth failure (401/403) is rethrown so a wrong key surfaces even on a blocked
+// scan; transient heartbeat failures are swallowed (stats-only, not critical).
 async function heartbeat(outcome) {
   try {
     await report({ heartbeat: true, outcome });
   } catch (e) {
-    console.log(`  [heartbeat ${outcome}] failed: ${e.message}`);
+    if (/fatal config/.test(e.message)) throw e;
+    console.log(`  [heartbeat ${outcome}] failed (non-fatal): ${e.message}`);
   }
 }
 
@@ -210,13 +246,18 @@ async function main() {
   const ts = new Date().toISOString();
   const r = await scanWithRetry();
 
-  // Non-ok outcomes: log distinctly + heartbeat the type. Exit 0 (they're not
-  // code failures) but they show up in /api/stats so they're not invisible.
+  // Non-ok outcomes: log distinctly + heartbeat the type. Heartbeat rethrows on
+  // a fatal auth error → exit 1; otherwise exit 0 (these are external conditions,
+  // visible in /api/stats).
   if (r.outcome !== 'ok') {
     console.log(`[${ts}] scan ${r.outcome}${r.detail ? ` (${r.detail})` : ''} after ${r.attempts} attempt(s) — reporter=${REPORTER_ID}`);
-    await heartbeat(r.outcome);
-    // A parse-error may mean Myntra changed structure (we'd miss deals) — make it loud.
     if (r.outcome === 'parse-error') console.error('⚠️  PARSE ERROR — Myntra page structure may have changed. Investigate.');
+    try {
+      await heartbeat(r.outcome);
+    } catch (e) {
+      console.error(`[${ts}] ${e.message}`);
+      process.exit(1); // fatal config (wrong key) surfaced even on a blocked scan
+    }
     process.exit(0);
   }
 
@@ -229,12 +270,15 @@ async function main() {
     console.log(`[${ts}] products=${r.products.length} attempts=${r.attempts} deals=${deals.length}${note}`);
     process.exit(0);
   } catch (e) {
-    // Config errors are always fatal. A DELIVERY failure while a deal is present
-    // is also fatal (the alert would be silently lost) — surface it non-zero.
-    console.error(`[${ts}] report error: ${e.message}`);
-    if (/fatal config/.test(e.message) || deals.length > 0) process.exit(1);
-    process.exit(0); // failed clear/no-deal report is non-critical
+    // ANY authoritative report that couldn't be delivered fails the run — a
+    // failed `deals: []` may be the critical STOP transition just as much as a
+    // failed deal alert. The worker's staleness guard is a backstop, not a
+    // reason to hide the delivery failure.
+    console.error(`[${ts}] report delivery failed: ${e.message}`);
+    process.exit(1);
   }
 }
 
-main();
+// Only run when executed directly (not when imported by tests).
+import { fileURLToPath } from 'node:url';
+if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) main();
