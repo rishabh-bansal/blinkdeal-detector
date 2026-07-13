@@ -1,15 +1,19 @@
 name: BLINKDEAL Detector
 
+# NOTE: GitHub throttles scheduled workflows heavily — the observed cadence is
+# ~1.5–2.5h gaps, ~8% of the requested rate, and events can be dropped entirely
+# (https://docs.github.com/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule).
+# So this is only a BACKUP. The primary, reliable detector is a residential
+# reporter (a Raspberry Pi) running scan.js every 5 min via cron. Watch
+# /api/status `reporterStale` to know if the Pi has gone quiet.
+
 on:
   schedule:
-    # Tiered by the 100-day BLINKDEAL pattern data (sessions ~6 AM–9 PM IST,
-    # near-zero overnight). GitHub cron is UTC; IST = UTC+5:30.
-    #
-    # ACTIVE (~07:30–23:30 IST): every 5 min
-    - cron: "*/5 2-17 * * *"
-    # OFF-HOURS (23:30–07:30 IST): every 30 min
-    - cron: "11,41 18-23 * * *"
-    - cron: "11,41 0-1 * * *"
+    # ACTIVE (~07:30–23:30 IST). GitHub cron is UTC; IST = UTC+5:30.
+    - cron: "*/15 2-17 * * *"
+    # OFF-HOURS
+    - cron: "41 18-23 * * *"
+    - cron: "41 0-1 * * *"
   workflow_dispatch: {}
 
 permissions:
@@ -19,15 +23,14 @@ jobs:
   detect:
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    # Fan out across parallel runners — each gets a different IP. Myntra blocks
-    # ~75% of GitHub IPs, so 1 runner ≈ 25% catch/trigger; 4 runners ≈ 58%;
-    # across a 13-min deal's ~3 triggers that's ~93%. `fail-fast: false` so a
-    # blocked shard never cancels the shard that got through. Public repo =
-    # free parallel jobs.
+    # Fan out across 2 parallel runners (different IPs) to raise the odds one
+    # gets past Myntra's IP block. Kept modest (2, not 4) now that the Pi is
+    # primary — avoids disproportionate hosted-runner usage. fail-fast: false so
+    # a blocked shard never cancels the one that got through.
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4]
+        shard: [1, 2]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

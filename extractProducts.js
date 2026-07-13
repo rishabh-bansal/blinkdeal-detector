@@ -4,14 +4,18 @@
 // `window.__myx = {...}` / a `"products":[...]` array). We pull that JSON out
 // directly — no headless browser needed.
 //
-// Unlike the naive bracket-counters in the reference repos, this scanner is
-// string-aware: it ignores brackets that appear inside JSON string values
-// (product descriptions can contain "[" / "]"), so it won't miscount.
+// Contract:
+//   - returns an ARRAY of validated product objects on success (may be empty
+//     only if Myntra genuinely served an empty products array),
+//   - returns NULL when no products structure could be found/parsed (so callers
+//     can distinguish "no deal" from "couldn't read the page" — a schema
+//     regression or a non-listing page must NOT look like a cleared deal).
+//
+// String-aware bracket scanning (ignores brackets inside JSON strings), entry
+// validation (every entry must be a real Myntra product), and a preference for
+// the largest valid array guard against picking an analytics `dataLayer.products`
+// blob or crashing on a `[null, …]` array.
 
-/**
- * Given HTML and the index of an opening bracket ('[' or '{'), return the
- * substring up to and including its matching close bracket, or null.
- */
 export function extractBalanced(str, startIdx) {
   const open = str[startIdx];
   if (open !== '[' && open !== '{') return null;
@@ -27,11 +31,9 @@ export function extractBalanced(str, startIdx) {
       else if (ch === '"') inStr = false;
       continue;
     }
-    if (ch === '"') {
-      inStr = true;
-    } else if (ch === open) {
-      depth++;
-    } else if (ch === close) {
+    if (ch === '"') inStr = true;
+    else if (ch === open) depth++;
+    else if (ch === close) {
       depth--;
       if (depth === 0) return str.slice(startIdx, i + 1);
     }
@@ -39,83 +41,109 @@ export function extractBalanced(str, startIdx) {
   return null;
 }
 
-function looksLikeProducts(arr) {
-  return (
-    Array.isArray(arr) &&
-    arr.length > 0 &&
-    arr.some((o) => o && typeof o === 'object' && ('productId' in o || 'price' in o))
-  );
+// A real Myntra product: has a productId AND a numeric price. Requiring
+// productId (not just `id`) rejects analytics/dataLayer product arrays.
+function isValidProduct(o) {
+  if (!o || typeof o !== 'object') return false;
+  const hasId = typeof o.productId === 'number' || typeof o.productId === 'string';
+  return hasId && typeof o.price === 'number';
 }
 
-// Strategy A: every `"products":` occurrence -> parse the array that follows.
-function tryProductsArrays(html) {
-  let from = 0;
-  const key = '"products"';
-  while (true) {
-    const k = html.indexOf(key, from);
-    if (k === -1) break;
-    from = k + key.length;
-    const bracket = html.indexOf('[', k);
-    if (bracket === -1) continue;
-    // Only accept if the '[' is right after the colon (avoid false hits).
-    const between = html.slice(k + key.length, bracket);
-    if (!/^\s*:\s*$/.test(between)) continue;
-    const json = extractBalanced(html, bracket);
-    if (!json) continue;
-    try {
-      const arr = JSON.parse(json);
-      if (looksLikeProducts(arr)) return arr;
-    } catch {
-      // keep scanning
+function validCount(arr) {
+  if (!Array.isArray(arr)) return -1;
+  let n = 0;
+  for (const o of arr) if (isValidProduct(o)) n++;
+  return n;
+}
+
+// DFS a parsed object for the array that looks most like Myntra's product list.
+// Prefers a value under a `products` key; otherwise the array with the most
+// valid products. Returns { arr, valid, viaProductsKey } or null.
+function bestProductArray(root) {
+  let best = null;
+  const seen = new Set();
+  const visit = (node, key, depth) => {
+    if (depth > 10 || node == null || typeof node !== 'object') return;
+    if (seen.has(node)) return;
+    seen.add(node);
+    if (Array.isArray(node)) {
+      const valid = validCount(node);
+      const viaKey = key === 'products';
+      if (valid > 0 || (viaKey && node.length === 0)) {
+        if (
+          !best ||
+          valid > best.valid ||
+          (valid === best.valid && viaKey && !best.viaProductsKey)
+        ) {
+          best = { arr: node, valid, viaProductsKey: viaKey };
+        }
+      }
+      for (const item of node) visit(item, key, depth + 1);
+      return;
     }
-  }
-  return null;
+    for (const k of Object.keys(node)) visit(node[k], k, depth + 1);
+  };
+  visit(root, null, 0);
+  return best;
 }
 
-// Strategy B: parse the whole `window.__myx = {...}` blob, then DFS for products.
-function tryMyxBlob(html) {
-  const markers = ['window.__myx =', 'window.__myx=', '__myx ='];
-  for (const m of markers) {
-    const idx = html.indexOf(m);
+function parseMyxBlob(html) {
+  for (const marker of ['window.__myx =', 'window.__myx=', '__myx =']) {
+    const idx = html.indexOf(marker);
     if (idx === -1) continue;
     const brace = html.indexOf('{', idx);
     if (brace === -1) continue;
     const json = extractBalanced(html, brace);
     if (!json) continue;
     try {
-      const root = JSON.parse(json);
-      const found = dfsProducts(root);
-      if (found) return found;
+      return JSON.parse(json);
     } catch {
-      // try next marker
+      /* try next marker */
     }
   }
   return null;
 }
 
-function dfsProducts(node, depth = 0) {
-  if (depth > 8 || node === null || typeof node !== 'object') return null;
-  if (Array.isArray(node)) {
-    if (looksLikeProducts(node)) return node;
-    for (const item of node) {
-      const r = dfsProducts(item, depth + 1);
-      if (r) return r;
+// Fallback: parse each `"products":[ … ]` occurrence and keep the best.
+function scanProductsKey(html) {
+  const key = '"products"';
+  let from = 0;
+  let best = null;
+  while (true) {
+    const k = html.indexOf(key, from);
+    if (k === -1) break;
+    from = k + key.length;
+    const bracket = html.indexOf('[', k);
+    if (bracket === -1) continue;
+    if (!/^\s*:\s*$/.test(html.slice(k + key.length, bracket))) continue;
+    const json = extractBalanced(html, bracket);
+    if (!json) continue;
+    let arr;
+    try {
+      arr = JSON.parse(json);
+    } catch {
+      continue;
     }
-    return null;
+    if (!Array.isArray(arr)) continue;
+    const valid = validCount(arr);
+    if ((valid > 0 || arr.length === 0) && (!best || valid > best.valid)) {
+      best = { arr, valid };
+    }
   }
-  if (looksLikeProducts(node.products)) return node.products;
-  for (const key of Object.keys(node)) {
-    const r = dfsProducts(node[key], depth + 1);
-    if (r) return r;
-  }
-  return null;
+  return best;
 }
 
 /**
- * Extract product objects from listing HTML. Returns [] if none found
- * (e.g. the page was an anti-bot challenge instead of real content).
+ * Returns validated product objects, or null if no products structure was found.
  */
 export function extractProducts(html) {
-  if (!html || typeof html !== 'string') return [];
-  return tryProductsArrays(html) || tryMyxBlob(html) || [];
+  if (!html || typeof html !== 'string') return null;
+
+  let candidate = null;
+  const myx = parseMyxBlob(html);
+  if (myx) candidate = bestProductArray(myx);
+  if (!candidate) candidate = scanProductsKey(html);
+  if (!candidate) return null;
+
+  return candidate.arr.filter(isValidProduct);
 }

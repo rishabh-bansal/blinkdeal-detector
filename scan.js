@@ -1,36 +1,43 @@
-// BLINKDEAL detector — runs on GitHub Actions.
+// BLINKDEAL detector — runs on a residential Pi (primary) or GitHub Actions
+// (fallback). Each run reads Myntra's gold-coin listing, reports any BLINKDEAL
+// deal to the blinkdeal Worker (blinkdeal.paype.co), which owns subscribers +
+// SMS fan-out and only notifies on transitions.
 //
-// Each scheduled run does one honest attempt to read Myntra's gold-coin
-// listing (with a few retries), reports any BLINKDEAL deal to the blinkdeal
-// Worker (blinkdeal.paype.co), and — if a deal is live — keeps polling for a
-// few minutes to catch when it clears. The Worker owns subscribers + SMS
-// fan-out and only notifies on transitions.
+// Design notes:
+//   - Myntra soft-blocks datacenter IPs by serving a ~480-byte "Site Maintenance"
+//     stub. That is an EXPECTED external condition (exit 0, no failure email).
+//   - We distinguish that verified block from genuine failures (HTTP errors,
+//     network errors, schema/parse regressions) so real problems are visible and
+//     a broken scan is NEVER mistaken for a "cleared deal".
+//   - The embedded JSON returns at most ~94 of the ~318 gold coins (rows=100 is
+//     the max the page inlines; the rest need the authenticated search API).
+//     BLINKDEAL is a category-wide coupon (seen on ~all coins), so the top ~94
+//     catch it; a product-specific coupon beyond #94 could be missed.
 //
-// IMPORTANT: Myntra soft-blocks datacenter IPs (GitHub runners included) by
-// serving a ~480-byte "Site Maintenance" stub to a large fraction of requests.
-// A blocked run is an EXPECTED external condition, NOT a code failure — so we
-// exit 0 and never spam failure emails. We only exit non-zero for real config
-// errors (missing/invalid REPORT_KEY).
-//
-// Zero npm dependencies: Node built-in fetch only.
+// Zero npm dependencies: Node 18+ built-in fetch only.
 import { extractProducts } from './extractProducts.js';
 
 const REPORT_URL = (process.env.REPORT_URL || 'https://blinkdeal.paype.co').replace(/\/$/, '');
 const REPORT_KEY = process.env.REPORT_KEY || '';
-// Identifies who's reporting (pi / github / laptop), for working/blocked stats.
-const REPORTER_ID = process.env.REPORTER_ID || 'unknown';
+const REPORTER_ID = (process.env.REPORTER_ID || 'unknown').slice(0, 20);
 const MYNTRA_URL = process.env.MYNTRA_URL || 'https://www.myntra.com/gold-coin';
+// rows=100 pulls the max the listing inlines (~94). Higher values return 0.
+const ROWS = 100;
 const KEYWORDS = (process.env.COUPON_KEYWORDS || 'blinkdeal')
   .toLowerCase().split(',').map((s) => s.trim()).filter(Boolean);
-const MAX_PAGES = parseInt(process.env.MAX_PAGES || '2', 10);
+const MAX_ATTEMPTS = intEnv('MAX_ATTEMPTS', 2, 1, 10);
+const ATTEMPT_DELAY_MS = intEnv('ATTEMPT_DELAY_MS', 3000, 0, 60000);
 
-// Attempts per job. Myntra's block is per-IP deterministic (verified: curl_cffi
-// with a perfect Chrome fingerprint got the same block on the same runner IP),
-// so retrying the SAME runner rarely helps — IP diversity is what matters. The
-// workflow gets that by fanning out across parallel runners (different IPs), so
-// each job just needs 1-2 quick tries.
-const MAX_ATTEMPTS = parseInt(process.env.MAX_ATTEMPTS || '2', 10);
-const ATTEMPT_DELAY_MS = parseInt(process.env.ATTEMPT_DELAY_MS || '3000', 10);
+function intEnv(name, def, min, max) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return def;
+  const n = parseInt(raw, 10);
+  if (!Number.isFinite(n) || n < min || n > max) {
+    console.error(`Invalid ${name}=${JSON.stringify(raw)} (expected integer ${min}–${max}).`);
+    process.exit(1); // config error — surface it, don't silently misbehave
+  }
+  return n;
+}
 
 const UAS = [
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
@@ -54,58 +61,76 @@ function headers(ua) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// One pass over the listing pages. Returns [] if blocked/empty.
-async function scanOnce(ua) {
-  const all = [];
-  const seen = new Set();
-  for (let page = 1; page <= MAX_PAGES; page++) {
-    const sep = MYNTRA_URL.includes('?') ? '&' : '?';
-    const url = page === 1 ? MYNTRA_URL : `${MYNTRA_URL}${sep}p=${page}`;
-    let html = '';
-    try {
-      const res = await fetch(url, { headers: headers(ua), redirect: 'follow', signal: AbortSignal.timeout(20000) });
-      html = await res.text();
-    } catch {
-      break;
-    }
-    const products = extractProducts(html);
-    if (!products.length) break;
-    let added = 0;
-    for (const p of products) {
-      const id = String(p.productId ?? p.id ?? '');
-      if (!id || seen.has(id)) continue;
-      seen.add(id); all.push(p); added++;
-    }
-    if (!added) break;
-  }
-  return all;
+function isMaintenanceStub(html) {
+  // Verified Akamai block signature: a tiny page titled "Site Maintenance".
+  return html.length < 4000 && /<title>\s*Site Maintenance\s*<\/title>/i.test(html);
 }
 
-// Retry the scan until we get real products or run out of attempts.
-async function scanWithRetry(maxAttempts) {
-  for (let i = 0; i < maxAttempts; i++) {
-    const ua = UAS[i % UAS.length];
-    const products = await scanOnce(ua);
-    if (products.length) return { products, attempts: i + 1 };
-    if (i < maxAttempts - 1) await sleep(ATTEMPT_DELAY_MS);
+// One fetch. Returns a TYPED outcome:
+//   { outcome: 'ok', products }        got a real product array
+//   { outcome: 'blocked' }             verified maintenance stub (expected)
+//   { outcome: 'http-error', detail }  non-2xx / redirect
+//   { outcome: 'network-error', detail }
+//   { outcome: 'parse-error', detail } 200 OK but no products structure found
+async function scanOnce(ua) {
+  const sep = MYNTRA_URL.includes('?') ? '&' : '?';
+  const url = `${MYNTRA_URL}${sep}rows=${ROWS}`;
+  let res;
+  try {
+    res = await fetch(url, {
+      headers: headers(ua),
+      redirect: 'manual', // don't silently follow redirects (or forward the key)
+      signal: AbortSignal.timeout(20000),
+    });
+  } catch (e) {
+    return { outcome: 'network-error', detail: String(e.message || e).split('\n')[0] };
   }
-  return { products: [], attempts: maxAttempts };
+  if (res.status >= 300 && res.status < 400) return { outcome: 'http-error', detail: `redirect ${res.status}` };
+  if (!res.ok) return { outcome: 'http-error', detail: `HTTP ${res.status}` };
+
+  let html;
+  try {
+    html = await res.text();
+  } catch (e) {
+    return { outcome: 'network-error', detail: `body read: ${e.message}` };
+  }
+  if (isMaintenanceStub(html)) return { outcome: 'blocked' };
+
+  const products = extractProducts(html);
+  if (products === null) {
+    return { outcome: 'parse-error', detail: `no products array (len=${html.length})` };
+  }
+  return { outcome: 'ok', products };
+}
+
+// Retry only on transient outcomes (block/http/network). A parse-error is a
+// schema regression — retrying the same page won't help, so surface it.
+async function scanWithRetry() {
+  let last;
+  for (let i = 0; i < MAX_ATTEMPTS; i++) {
+    const ua = UAS[i % UAS.length];
+    last = await scanOnce(ua);
+    last.attempts = i + 1;
+    if (last.outcome === 'ok' || last.outcome === 'parse-error') return last;
+    if (i < MAX_ATTEMPTS - 1) await sleep(ATTEMPT_DELAY_MS);
+  }
+  return last;
 }
 
 function detect(products) {
   const deals = [];
   for (const p of products) {
+    const id = String(p.productId ?? p.id ?? '').trim();
+    if (!id) continue; // no stable id → can't dedup/report meaningfully
     const cd = p.couponData || {};
-    // Match against the ENTIRE couponData JSON — robust to Myntra's structure
-    // changes. The coupon code (e.g. BLINKDEAL6) lives in couponData.tagLink
-    // ("Coupons:BLINKDEAL6_…") and couponData.couponDescription.couponCode,
-    // and couponDescription flipped from a string to a nested object.
+    // Match against the whole couponData JSON — robust to Myntra's structure
+    // changes. Code (e.g. BLINKDEAL6) lives in couponData.tagLink and
+    // couponData.couponDescription.couponCode; couponDescription is now an object.
     const title = p.product || p.productName || '';
     const hay = `${title} ${JSON.stringify(cd)}`.toLowerCase();
     const matched = KEYWORDS.find((k) => hay.includes(k));
     if (!matched) continue;
 
-    // Build a human-readable coupon label for the alert/log.
     const desc = cd.couponDescription;
     let coupon = '';
     if (desc && typeof desc === 'object') {
@@ -116,80 +141,101 @@ function detect(products) {
     }
     if (!coupon) coupon = matched.toUpperCase();
 
-    const landing = String(p.landingPageUrl || '').replace(/^\//, '');
-    deals.push({
-      id: String(p.productId ?? ''),
-      title,
-      coupon: coupon.slice(0, 160),
-      url: landing ? `https://www.myntra.com/${landing}` : 'https://www.myntra.com/gold-coin',
-    });
+    const landing = String(p.landingPageUrl || '');
+    const url = /^https?:\/\//i.test(landing)
+      ? landing
+      : `https://www.myntra.com/${landing.replace(/^\//, '')}`;
+
+    deals.push({ id, title, coupon: coupon.slice(0, 160), url: url.slice(0, 500) });
   }
   return deals;
 }
 
-async function report(deals, productsSeen) {
-  const res = await fetch(`${REPORT_URL}/api/report`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', 'x-admin-key': REPORT_KEY },
-    body: JSON.stringify({ productsSeen, deals, reporter: REPORTER_ID }),
-    signal: AbortSignal.timeout(30000),
-  });
-  const body = await res.json().catch(() => ({}));
-  if (res.status === 401) throw new Error('REPORT_KEY rejected by worker (401) — check the Actions secret');
-  return { status: res.status, ...body };
+// Reliable report. Retries 429/5xx with backoff; treats 401/403 as fatal config
+// errors; throws on any non-2xx so the caller can decide (an undelivered DEAL is
+// fatal). Redirects disabled so the x-admin-key is never forwarded to another host.
+async function report(body) {
+  let lastErr;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    let res;
+    try {
+      res = await fetch(`${REPORT_URL}/api/report`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-admin-key': REPORT_KEY },
+        body: JSON.stringify({ ...body, reporter: REPORTER_ID }),
+        redirect: 'error',
+        signal: AbortSignal.timeout(30000),
+      });
+    } catch (e) {
+      lastErr = new Error(`report network error: ${String(e.message || e).split('\n')[0]}`);
+      if (attempt < 2) { await sleep(2000 * (attempt + 1)); continue; }
+      throw lastErr;
+    }
+    if (res.status === 401 || res.status === 403) {
+      throw new Error(`REPORT_KEY rejected (${res.status}) — fatal config error`);
+    }
+    if (res.status === 429 || res.status >= 500) {
+      lastErr = new Error(`report failed ${res.status}`);
+      if (attempt < 2) { await sleep(2000 * (attempt + 1)); continue; }
+      throw lastErr;
+    }
+    if (!res.ok) throw new Error(`report failed ${res.status}`);
+    return res.json().catch(() => ({}));
+  }
+  throw lastErr;
 }
 
-// Tell the worker this scan was blocked (Akamai maintenance stub), for stats.
-async function reportBlocked() {
+// Best-effort heartbeat so /api/stats can tally block/http/network/parse outcomes.
+async function heartbeat(outcome) {
   try {
-    await fetch(`${REPORT_URL}/api/report`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-admin-key': REPORT_KEY },
-      body: JSON.stringify({ blocked: true, reporter: REPORTER_ID }),
-      signal: AbortSignal.timeout(15000),
-    });
-  } catch {
-    /* best-effort */
+    await report({ heartbeat: true, outcome });
+  } catch (e) {
+    console.log(`  [heartbeat ${outcome}] failed: ${e.message}`);
   }
 }
 
 async function main() {
   if (!REPORT_KEY) {
-    console.error('REPORT_KEY missing — set the Actions secret.');
-    process.exit(1); // genuine config error → worth surfacing
+    console.error('REPORT_KEY missing.');
+    process.exit(1);
+  }
+  if (!/^https:\/\//i.test(REPORT_URL)) {
+    console.error(`REPORT_URL must be https (got ${REPORT_URL}).`);
+    process.exit(1);
+  }
+  if (KEYWORDS.length === 0) {
+    console.error('COUPON_KEYWORDS is empty after trimming — nothing to match.');
+    process.exit(1);
   }
 
-  const started = new Date().toISOString();
-  const { products, attempts } = await scanWithRetry(MAX_ATTEMPTS);
+  const ts = new Date().toISOString();
+  const r = await scanWithRetry();
 
-  if (products.length === 0) {
-    // Myntra served the maintenance stub to this runner's IP on every attempt.
-    // Expected for datacenter IPs — NOT a failure. Log the block, exit 0.
-    console.log(`[${started}] blocked after ${attempts} attempts (Myntra maintenance stub to ${REPORTER_ID}) — skipping. Not a failure.`);
-    await reportBlocked();
+  // Non-ok outcomes: log distinctly + heartbeat the type. Exit 0 (they're not
+  // code failures) but they show up in /api/stats so they're not invisible.
+  if (r.outcome !== 'ok') {
+    console.log(`[${ts}] scan ${r.outcome}${r.detail ? ` (${r.detail})` : ''} after ${r.attempts} attempt(s) — reporter=${REPORTER_ID}`);
+    await heartbeat(r.outcome);
+    // A parse-error may mean Myntra changed structure (we'd miss deals) — make it loud.
+    if (r.outcome === 'parse-error') console.error('⚠️  PARSE ERROR — Myntra page structure may have changed. Investigate.');
     process.exit(0);
   }
 
-  // Got through. Report current state — the Worker handles start/stop
-  // transitions + subscriber SMS. Frequent triggers (every 5 min active) catch
-  // both the deal appearing and clearing; one of the parallel runners getting
-  // through per trigger is enough.
-  const deals = detect(products);
+  const deals = detect(r.products);
   try {
-    const r = await report(deals, products.length);
+    const resp = await report({ productsSeen: r.products.length, deals });
     const note = deals.length
-      ? ` 🟢 DEAL x${deals.length} (worker: new=${r.newCount}, notified=${r.notifiedCount})`
-      : r.cleared ? ' (worker: cleared, stop sent)' : '';
-    console.log(`[${started}] products=${products.length} attempts=${attempts} deals=${deals.length}${note}`);
+      ? ` 🟢 DEAL x${deals.length} (worker: new=${resp.newCount}, notified=${resp.notifiedCount})`
+      : resp.cleared ? ' (worker: cleared, stop sent)' : '';
+    console.log(`[${ts}] products=${r.products.length} attempts=${r.attempts} deals=${deals.length}${note}`);
+    process.exit(0);
   } catch (e) {
-    if (/REPORT_KEY rejected/.test(e.message)) {
-      console.error(e.message);
-      process.exit(1);
-    }
-    console.log(`[${started}] report error (transient): ${e.message}`);
+    // Config errors are always fatal. A DELIVERY failure while a deal is present
+    // is also fatal (the alert would be silently lost) — surface it non-zero.
+    console.error(`[${ts}] report error: ${e.message}`);
+    if (/fatal config/.test(e.message) || deals.length > 0) process.exit(1);
+    process.exit(0); // failed clear/no-deal report is non-critical
   }
-
-  process.exit(0);
 }
 
 main();
