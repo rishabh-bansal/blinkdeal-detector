@@ -2,7 +2,8 @@
 // Run with: npm test
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { detect, safeMyntraUrl } from './scan.js';
+import { readFileSync } from 'node:fs';
+import { detect, safeMyntraUrl, SCAN_VERSION } from './scan.js';
 
 const coin = (over = {}) => ({ productId: 111, price: 9900, product: 'Kalyan 24K 1g', ...over });
 
@@ -46,4 +47,9 @@ test('safeMyntraUrl: absolute non-myntra host → falls back, never external', (
 
 test('safeMyntraUrl: absolute https myntra host → kept', () => {
   assert.equal(safeMyntraUrl('https://www.myntra.com/gold-coin/x/1/buy'), 'https://www.myntra.com/gold-coin/x/1/buy');
+});
+
+test('SCAN_VERSION matches package.json version (catches version drift)', () => {
+  const pkg = JSON.parse(readFileSync(new URL('./package.json', import.meta.url)));
+  assert.equal(SCAN_VERSION, pkg.version);
 });

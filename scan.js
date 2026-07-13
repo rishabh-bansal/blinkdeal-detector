@@ -14,9 +14,9 @@
 //     default listing inlines in one request are plenty to detect it.
 //
 // Zero npm dependencies: Node 18+ built-in fetch only.
-import { extractProducts } from './extractProducts.js';
+import { extractProductsWithMeta } from './extractProducts.js';
 
-const SCAN_VERSION = '2.1.0'; // sent with every report so you can tell which code a reporter runs
+export const SCAN_VERSION = '2.2.0'; // sent with every report so you can tell which code a reporter runs
 const REPORT_URL = (process.env.REPORT_URL || 'https://blinkdeal.paype.co').replace(/\/$/, '');
 const REPORT_KEY = process.env.REPORT_KEY || '';
 const REPORTER_ID = (process.env.REPORTER_ID || 'unknown').slice(0, 20);
@@ -101,11 +101,11 @@ async function scanOnce(ua) {
   }
   if (isMaintenanceStub(html)) return { outcome: 'blocked' };
 
-  const products = extractProducts(html);
+  const { products, exact } = extractProductsWithMeta(html);
   if (products === null) {
     return { outcome: 'parse-error', detail: `no products array (len=${html.length})` };
   }
-  return { outcome: 'ok', products };
+  return { outcome: 'ok', products, exact };
 }
 
 // Retry only on transient outcomes (block/http/network). A parse-error is a
@@ -174,7 +174,12 @@ export function detect(products) {
 // Reliable report. Retries 429/5xx with backoff; treats 401/403 as fatal config
 // errors; throws on any non-2xx so the caller can decide (an undelivered DEAL is
 // fatal). Redirects disabled so the x-admin-key is never forwarded to another host.
-async function report(body) {
+//
+// `kind` picks the expected ack SHAPE so a heartbeat-shaped ack can't slip
+// through as a deal-report success or vice versa:
+//   'deal'      -> { ts: string, ('dealCount' in ack || ack.gated) }
+//   'heartbeat' -> { ok: true }
+async function report(body, kind = 'deal') {
   let lastErr;
   for (let attempt = 0; attempt < 3; attempt++) {
     let res;
@@ -209,20 +214,24 @@ async function report(body) {
     } catch {
       throw new Error('report ack was not JSON');
     }
-    if (!ack || typeof ack !== 'object' || (typeof ack.ts !== 'string' && ack.ok !== true)) {
-      throw new Error(`report ack missing expected fields: ${JSON.stringify(ack).slice(0, 80)}`);
+    const validAck = kind === 'heartbeat'
+      ? ack && ack.ok === true
+      : ack && typeof ack.ts === 'string' && ('dealCount' in ack || ack.gated);
+    if (!validAck) {
+      throw new Error(`report ack missing expected ${kind} fields: ${JSON.stringify(ack).slice(0, 80)}`);
     }
     return ack;
   }
   throw lastErr;
 }
 
-// Heartbeat so /api/stats can tally block/http/network/parse outcomes. A fatal
-// auth failure (401/403) is rethrown so a wrong key surfaces even on a blocked
-// scan; transient heartbeat failures are swallowed (stats-only, not critical).
+// Heartbeat so /api/stats can tally block/http/network/parse/fallback-empty
+// outcomes. A fatal auth failure (401/403) is rethrown so a wrong key surfaces
+// even on a blocked scan; transient heartbeat failures are swallowed
+// (stats-only, not critical).
 async function heartbeat(outcome) {
   try {
-    await report({ heartbeat: true, outcome });
+    await report({ heartbeat: true, outcome }, 'heartbeat');
   } catch (e) {
     if (/fatal config/.test(e.message)) throw e;
     console.log(`  [heartbeat ${outcome}] failed (non-fatal): ${e.message}`);
@@ -262,12 +271,32 @@ async function main() {
   }
 
   const deals = detect(r.products);
+
+  // Provenance guard: if the products array came from a FALLBACK heuristic
+  // (not Myntra's exact searchData.results.products path) and found zero
+  // BLINKDEAL matches, we cannot trust that as "no deal" — the fallback could
+  // have picked the wrong array entirely (e.g. an unrelated analytics blob
+  // that happens to contain valid-shaped {productId, price} entries). Sending
+  // this as an authoritative deals:[] risks falsely clearing a live deal. A
+  // POSITIVE match via fallback is still trusted (a specific coupon-code
+  // string match is not something a wrong array would produce by chance).
+  if (!r.exact && deals.length === 0) {
+    console.log(`[${ts}] products=${r.products.length} attempts=${r.attempts} FALLBACK-EXTRACTION found 0 deals — not authoritative, sending heartbeat only (not a clear).`);
+    try {
+      await heartbeat('fallback-empty');
+    } catch (e) {
+      console.error(`[${ts}] ${e.message}`);
+      process.exit(1);
+    }
+    process.exit(0);
+  }
+
   try {
     const resp = await report({ productsSeen: r.products.length, deals });
     const note = deals.length
       ? ` 🟢 DEAL x${deals.length} (worker: new=${resp.newCount}, notified=${resp.notifiedCount})`
       : resp.cleared ? ' (worker: cleared, stop sent)' : '';
-    console.log(`[${ts}] products=${r.products.length} attempts=${r.attempts} deals=${deals.length}${note}`);
+    console.log(`[${ts}] products=${r.products.length} attempts=${r.attempts} deals=${deals.length}${note}${r.exact ? '' : ' (fallback-extraction)'}`);
     process.exit(0);
   } catch (e) {
     // ANY authoritative report that couldn't be delivered fails the run — a

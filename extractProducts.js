@@ -125,16 +125,20 @@ function scanProductsKey(html) {
 }
 
 /**
- * Returns validated product objects, or NULL if a real, non-empty product list
- * could not be located. NULL means "couldn't read the page" (block / error /
- * schema change) — callers must treat it as unknown, never as "no deals".
- *
- * An empty array is NEVER returned as success: for the gold-coin listing an
- * empty result is always a block/error, and returning [] would false-clear an
- * active deal. So we require at least one valid product.
+ * Returns { products, exact }.
+ *   products: validated product array, or NULL if nothing could be located.
+ *             NULL means "couldn't read the page" — callers must treat it as
+ *             unknown, never as "no deals". An empty array is NEVER returned
+ *             as success (a present-but-empty exact array ⇒ null too).
+ *   exact:    true only if products came from Myntra's known, exact
+ *             `searchData.results.products` path. false means a heuristic
+ *             fallback (DFS best-array or generic `"products":[...]` scan)
+ *             selected the array — it could in principle be the wrong array,
+ *             so callers should NOT treat a fallback-sourced empty-deals
+ *             result as an authoritative "clear" (see detect() callers).
  */
-export function extractProducts(html) {
-  if (!html || typeof html !== 'string') return null;
+export function extractProductsWithMeta(html) {
+  if (!html || typeof html !== 'string') return { products: null, exact: false };
 
   const myx = parseMyxBlob(html);
   if (myx) {
@@ -143,14 +147,19 @@ export function extractProducts(html) {
     const exact = myx?.searchData?.results?.products;
     if (Array.isArray(exact)) {
       const valid = exact.filter(isValidProduct);
-      return valid.length > 0 ? valid : null; // present-but-empty ⇒ block/error
+      return { products: valid.length > 0 ? valid : null, exact: true }; // present-but-empty ⇒ block/error
     }
     // Exact path absent (structure changed) → largest valid array as a fallback.
     const best = bestProductArray(myx);
-    if (best) return best.arr.filter(isValidProduct);
+    if (best) return { products: best.arr.filter(isValidProduct), exact: false };
   }
 
   const b = scanProductsKey(html);
-  if (b) return b.arr.filter(isValidProduct);
-  return null;
+  if (b) return { products: b.arr.filter(isValidProduct), exact: false };
+  return { products: null, exact: false };
+}
+
+/** Back-compat wrapper: same as extractProductsWithMeta(html).products. */
+export function extractProducts(html) {
+  return extractProductsWithMeta(html).products;
 }

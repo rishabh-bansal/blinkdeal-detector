@@ -23,20 +23,17 @@ jobs:
   detect:
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    # Fan out across 2 parallel runners (different IPs) to raise the odds one
-    # gets past Myntra's IP block. Kept modest (2, not 4) now that the Pi is
-    # primary — avoids disproportionate hosted-runner usage. fail-fast: false so
-    # a blocked shard never cancels the one that got through.
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [1, 2]
+    # Single runner. The Pi is primary; GitHub is only a backup, and the worker
+    # gates its state while the Pi is fresh — so 2 parallel shards just added a
+    # real duplicate-alert race (two shards succeeding in the rare window when
+    # the Pi IS stale) for little benefit. One shard removes that race entirely
+    # and halves hosted-runner usage.
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
-      - name: Run detector (shard ${{ matrix.shard }})
+      - name: Run detector
         env:
           REPORT_URL: https://blinkdeal.paype.co
           REPORT_KEY: ${{ secrets.REPORT_KEY }}
